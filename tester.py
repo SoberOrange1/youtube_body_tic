@@ -15,7 +15,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from sklearn.metrics import classification_report, confusion_matrix, accuracy_score, f1_score, precision_score, recall_score
+from sklearn.metrics import classification_report, confusion_matrix, accuracy_score, f1_score, precision_score, recall_score, roc_curve, auc, roc_auc_score
 import matplotlib.pyplot as plt
 import seaborn as sns
 from tqdm import tqdm
@@ -37,14 +37,20 @@ class TicModelTester:
     Supports testing multiple folds within an experiment
     """
     
-    def __init__(self, exp_dir: str, device: str = None):
+    def __init__(self, exp_dir: str, device: str = None, ckpt_type: str = 'best', checkpoint_epoch: int = None, checkpoint_map: dict = None):
         """
         Args:
             exp_dir: Path to experiment directory (e.g., outputs/exp_001)
             device: Device to use ('cuda' or 'cpu'). Auto-detect if None
+            ckpt_type: Checkpoint type to load ('best', 'last', or 'epoch')
+            checkpoint_epoch: Epoch number to load when ckpt_type='epoch'
+            checkpoint_map: Optional per-fold epoch mapping
         """
         self.exp_dir = Path(exp_dir)
         self.device = torch.device(device if device else ('cuda' if torch.cuda.is_available() else 'cpu'))
+        self.ckpt_type = ckpt_type  # 'best', 'last', or 'epoch'
+        self.checkpoint_epoch = checkpoint_epoch  # Uniform epoch for all folds if ckpt_type == 'epoch'
+        self.checkpoint_map = checkpoint_map or {}  # Optional per-fold epoch mapping
         
         # Find all fold directories in the experiment
         self.fold_dirs = self._find_fold_directories()
@@ -86,11 +92,62 @@ class TicModelTester:
         
         return split_info, training_config
     
+    def _select_checkpoint_for_fold(self, fold_dir: Path):
+        """Select checkpoint file name for a given fold.
+        Priority: checkpoint_map (exact match) > checkpoint_map (substring match) > ckpt_type best/last/epoch.
+        Returns (ckpt_name, source_str)."""
+        # 1) If a mapping is provided, try exact key match
+        if self.checkpoint_map:
+            # Exact match by full folder name
+            if fold_dir.name in self.checkpoint_map:
+                entry = self.checkpoint_map[fold_dir.name]
+                ckpt = self._interpret_checkpoint_entry(entry, fold_dir.name)
+                if ckpt:
+                    return ckpt, f"map:exact:{fold_dir.name}"
+            # Substring match: allow keys without timestamp to match
+            best_key = None
+            for key in self.checkpoint_map.keys():
+                if key and key in fold_dir.name:
+                    if best_key is None or len(key) > len(best_key):
+                        best_key = key
+            if best_key is not None:
+                entry = self.checkpoint_map[best_key]
+                ckpt = self._interpret_checkpoint_entry(entry, best_key)
+                if ckpt:
+                    return ckpt, f"map:substr:{best_key}"
+        
+        # 2) Fall back to ckpt_type
+        if self.ckpt_type == 'best':
+            return 'best_model.pt', 'ckpt_type:best'
+        if self.ckpt_type == 'last':
+            return 'last_model.pt', 'ckpt_type:last'
+        if self.ckpt_type == 'epoch':
+            if self.checkpoint_epoch is None:
+                raise ValueError("ckpt_type is 'epoch' but --checkpoint_epoch not provided and no mapping matched")
+            return f"checkpoint_epoch_{int(self.checkpoint_epoch)}.pt", f"ckpt_type:epoch:{int(self.checkpoint_epoch)}"
+        raise ValueError(f"Unknown ckpt_type: {self.ckpt_type}")
+    
+    def _interpret_checkpoint_entry(self, entry, key_for_error: str):
+        """Interpret a checkpoint_map entry value and return a checkpoint file name or raise error."""
+        if isinstance(entry, str):
+            val = entry.strip().lower()
+            if val == 'best':
+                return 'best_model.pt'
+            if val == 'last':
+                return 'last_model.pt'
+            if val.isdigit():
+                return f"checkpoint_epoch_{int(val)}.pt"
+            raise ValueError(f"Invalid checkpoint_map value for key '{key_for_error}': {entry} (use integer epoch, 'best', or 'last')")
+        if isinstance(entry, (int, float)):
+            return f"checkpoint_epoch_{int(entry)}.pt"
+        raise ValueError(f"Invalid checkpoint_map type for key '{key_for_error}': {type(entry)}")
+    
     def load_model(self, fold_dir: Path, training_config: dict):
-        """Load trained model from checkpoint"""
+        """Load trained model from checkpoint (best, last, or epoch-based)"""
         # Build model configuration
         model_config = training_config.get('model_config', {})
         lora_config = training_config.get('lora_config', {})
+        prediction_mode = model_config.get('prediction_mode', 'segment')
         
         # Create model with same architecture
         model = MotionPatchesTicClassifierWithLoRA(
@@ -104,15 +161,25 @@ class TicModelTester:
             lora_r=lora_config.get('lora_r', 16),
             lora_alpha=lora_config.get('lora_alpha', 32),
             lora_dropout=lora_config.get('lora_dropout', 0.1),
-            feature_dim=model_config.get('feature_dim', 7)
+            feature_dim=model_config.get('feature_dim', 7),
+            prediction_mode=prediction_mode
         ).to(self.device)
         
-        # Load trained weights
-        checkpoint_path = fold_dir / 'best_model.pt'
-        model.load_state_dict(torch.load(checkpoint_path, map_location=self.device))
+        # Select checkpoint using mapping (with fallback to ckpt_type)
+        ckpt_name, source = self._select_checkpoint_for_fold(fold_dir)
+        checkpoint_path = fold_dir / ckpt_name
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(f"Checkpoint not found for fold {fold_dir.name}: {checkpoint_path}")
+        
+        state_dict = torch.load(checkpoint_path, map_location=self.device)
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        if missing:
+            log.warning(f"Missing keys when loading {ckpt_name} (first 5): {missing[:5]}")
+        if unexpected:
+            log.warning(f"Unexpected keys when loading {ckpt_name} (first 5): {unexpected[:5]}")
         model.eval()
         
-        log.info(f"Loaded model from: {checkpoint_path}")
+        log.info(f"Loaded model from: {checkpoint_path} (source: {source})")
         
         return model
     
@@ -142,7 +209,7 @@ class TicModelTester:
     
     @torch.no_grad()
     def evaluate_fold(self, model, test_loader):
-        """Evaluate model on test data"""
+        """Evaluate model on test data (supports segment and frame prediction modes)"""
         model.eval()
         
         all_preds = []
@@ -154,14 +221,24 @@ class TicModelTester:
             batch_y = batch_y.to(self.device)
             
             # Forward pass
-            logits = model(batch_x)
-            probs = torch.softmax(logits, dim=1)
-            preds = torch.argmax(probs, dim=1)
+            out = model(batch_x)
+            if isinstance(out, tuple) and len(out) == 2:
+                _, logits = out
+            else:
+                logits = out
             
-            # Collect results
-            all_preds.extend(preds.cpu().numpy())
-            all_labels.extend(batch_y.cpu().numpy())
-            all_probs.extend(probs.cpu().numpy())
+            if logits.dim() == 3:  # Frame-level: (B, T, C)
+                probs = torch.softmax(logits, dim=-1)
+                preds = probs.argmax(dim=-1)  # (B, T)
+                all_preds.extend(preds.cpu().numpy().reshape(-1))
+                all_labels.extend(batch_y.cpu().numpy().reshape(-1))
+                all_probs.extend(probs.cpu().numpy().reshape(-1, probs.size(-1)))
+            else:  # Segment-level: (B, C)
+                probs = torch.softmax(logits, dim=1)
+                preds = probs.argmax(dim=1)
+                all_preds.extend(preds.cpu().numpy())
+                all_labels.extend(batch_y.cpu().numpy())
+                all_probs.extend(probs.cpu().numpy())
         
         all_preds = np.array(all_preds)
         all_labels = np.array(all_labels)
@@ -197,10 +274,11 @@ class TicModelTester:
         
         # Determine test videos
         if test_videos is None:
-            # Use test_videos from split_info if available, otherwise use val_videos
-            test_videos = split_info.get('test_videos', [])
-            if not test_videos:
-                test_videos = split_info.get('val_videos', [])
+            test_videos = split_info.get('test_videos', []) or split_info.get('val_videos', [])
+        
+        # Log val/test IDs for this fold
+        log.info(f"Fold {fold_dir.name} - Val videos: {split_info.get('val_videos', [])}")
+        log.info(f"Fold {fold_dir.name} - Test videos: {test_videos}")
         
         if not test_videos:
             log.warning(f"No test videos specified for fold {fold_dir.name}, skipping")
@@ -300,8 +378,12 @@ class TicModelTester:
         # Aggregate results
         aggregated_results = self._aggregate_results(all_fold_results)
         
-        # Save aggregated results
+        # Save aggregated results JSON and plot
         self._save_aggregated_results(aggregated_results)
+        
+        # Also save aggregated confusion matrix, classification report (per-class and overall),
+        # predictions CSV, and ROC AUC curve into exp_dir/test
+        self._save_aggregated_test_artifacts(all_fold_results)
         
         return aggregated_results
     
@@ -422,6 +504,84 @@ class TicModelTester:
         # Create summary visualization
         self._plot_fold_comparison(aggregated_results)
     
+    def _save_aggregated_test_artifacts(self, all_fold_results: list):
+        """Create exp_dir/test and save aggregated confusion matrix, classification report, predictions CSV, and ROC AUC curve."""
+        # Create test output directory under the experiment directory
+        test_dir = self.exp_dir / 'test'
+        test_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Concatenate predictions, labels, and probabilities across all folds
+        all_labels = np.concatenate([r['metrics']['labels'] for r in all_fold_results])
+        all_preds = np.concatenate([r['metrics']['predictions'] for r in all_fold_results])
+        # Probabilities may be missing in edge cases; guard accordingly
+        if all('probabilities' in r['metrics'] for r in all_fold_results):
+            all_probs = np.concatenate([r['metrics']['probabilities'] for r in all_fold_results], axis=0)
+        else:
+            all_probs = None
+        
+        # Save overall confusion matrix image
+        class_names = ['Non-tic', 'Tic']
+        cm = confusion_matrix(all_labels, all_preds)
+        plt.figure(figsize=(6, 5))
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+                    xticklabels=class_names, yticklabels=class_names)
+        plt.title('Aggregated Confusion Matrix (All Folds)')
+        plt.ylabel('True Label')
+        plt.xlabel('Predicted Label')
+        plt.tight_layout()
+        plt.savefig(test_dir / 'aggregated_confusion_matrix.png', dpi=300)
+        plt.close()
+        
+        # Save classification report (includes per-class and overall metrics)
+        report = classification_report(all_labels, all_preds, target_names=class_names, digits=4)
+        with open(test_dir / 'aggregated_classification_report.txt', 'w', encoding='utf-8') as f:
+            f.write("Aggregated Test Results (All Folds)\n")
+            f.write("="*70 + "\n\n")
+            f.write(report)
+        
+        # Save aggregated predictions to CSV (label, pred, prob_non_tic, prob_tic)
+        csv_path = test_dir / 'aggregated_predictions.csv'
+        with open(csv_path, 'w', encoding='utf-8') as fw:
+            # Write header
+            fw.write('label,pred,prob_non_tic,prob_tic\n')
+            # Write rows; if probabilities are missing, write NaNs
+            if all_probs is not None:
+                for i in range(len(all_labels)):
+                    p0 = float(all_probs[i, 0]) if all_probs.shape[1] > 0 else float('nan')
+                    p1 = float(all_probs[i, 1]) if all_probs.shape[1] > 1 else float('nan')
+                    fw.write(f"{int(all_labels[i])},{int(all_preds[i])},{p0:.6f},{p1:.6f}\n")
+            else:
+                for i in range(len(all_labels)):
+                    fw.write(f"{int(all_labels[i])},{int(all_preds[i])},,\n")
+        
+        # Plot ROC AUC curve (binary) if probabilities are available
+        if all_probs is not None and all_probs.shape[1] == 2:
+            # Use probability of the positive class (Tic) as scores
+            y_true = all_labels
+            y_score = all_probs[:, 1]
+            try:
+                fpr, tpr, _ = roc_curve(y_true, y_score)
+                roc_auc = auc(fpr, tpr)
+                plt.figure(figsize=(6, 5))
+                plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (AUC = {roc_auc:.4f})')
+                plt.plot([0, 1], [0, 1], color='navy', lw=1, linestyle='--')
+                plt.xlim([0.0, 1.0])
+                plt.ylim([0.0, 1.05])
+                plt.xlabel('False Positive Rate')
+                plt.ylabel('True Positive Rate')
+                plt.title('Aggregated ROC Curve (All Folds)')
+                plt.legend(loc="lower right")
+                plt.tight_layout()
+                plt.savefig(test_dir / 'aggregated_roc_auc.png', dpi=300)
+                plt.close()
+                # Also save ROC AUC score in a small txt
+                with open(test_dir / 'aggregated_roc_auc.txt', 'w', encoding='utf-8') as f:
+                    f.write(f"ROC AUC: {roc_auc:.6f}\n")
+            except Exception as e:
+                log.warning(f"Failed to compute ROC AUC: {e}")
+        else:
+            log.info("Probabilities not available or not binary; skipping ROC AUC plot.")
+    
     def _plot_fold_comparison(self, aggregated_results: dict):
         """Create visualization comparing all folds"""
         per_fold = aggregated_results['per_fold_results']
@@ -467,8 +627,23 @@ class TicModelTester:
 def main():
     parser = argparse.ArgumentParser(description='Test tic classification models by experiment')
     
-    parser.add_argument('--exp_dir', type=str, required=True,
+    parser.add_argument('--exp_dir', type=str, default=None,
                        help='Path to experiment directory (e.g., outputs/exp_001)')
+    
+    parser.add_argument('--exp_num', type=str, default=None,
+                       help='Experiment number (e.g., exp_001). Overrides exp_dir')
+    
+    parser.add_argument('--outputs_root', type=str, default=r'A:\youtube_body\data_folder\outputs',
+                       help='Root outputs directory')
+    
+    parser.add_argument('--ckpt_type', type=str, choices=['best', 'last', 'epoch'], default='best',
+                       help='Checkpoint type to test: best, last or specific epoch')
+    
+    parser.add_argument('--checkpoint_epoch', type=int, default=None,
+                       help='Epoch number to load when ckpt_type=epoch (e.g., 15)')
+    
+    parser.add_argument('--checkpoint_map', type=str, default=None,
+                       help='Path to JSON mapping fold_dir_name (full or prefix substring) -> epoch|"best"|"last" for per-fold checkpoint selection')
     
     parser.add_argument('--test_videos', type=str, nargs='+', default=None,
                        help='Test video IDs (e.g., 05 06). If not provided, uses split info')
@@ -486,10 +661,26 @@ def main():
     parser.add_argument('--single_fold', type=str, default=None,
                        help='Test only a specific fold (provide fold directory name)')
     
+    parser.add_argument('--map_only', action='store_true',
+                        help='If set, only test folds present (exact or substring) in checkpoint_map')
+    
     args = parser.parse_args()
     
+    if args.exp_num and not args.exp_dir:
+        args.exp_dir = os.path.join(args.outputs_root, args.exp_num)
+    
+    if not args.exp_dir:
+        raise ValueError('You must provide --exp_dir or --exp_num')
+    
+    # Load checkpoint map if provided
+    ckpt_map_dict = None
+    if args.checkpoint_map:
+        with open(args.checkpoint_map, 'r', encoding='utf-8') as f:
+            ckpt_map_dict = json.load(f)
+    
     # Create tester
-    tester = TicModelTester(exp_dir=args.exp_dir, device=args.device)
+    tester = TicModelTester(exp_dir=args.exp_dir, device=args.device, ckpt_type=args.ckpt_type,
+                            checkpoint_epoch=args.checkpoint_epoch, checkpoint_map=ckpt_map_dict)
     
     if args.single_fold:
         # Test single fold
@@ -505,7 +696,14 @@ def main():
             annotation_dir=args.annotation_dir
         )
     else:
-        # Test all folds
+        if args.map_only and ckpt_map_dict:
+            keys = list(ckpt_map_dict.keys())
+            filtered = []
+            for fd in tester.fold_dirs:
+                if fd.name in keys or any(k in fd.name for k in keys):
+                    filtered.append(fd)
+            tester.fold_dirs = filtered
+            log.info(f"map_only active. Testing folds: {[fd.name for fd in tester.fold_dirs]}")
         tester.test_all_folds(
             pose_data_dir=args.pose_data_dir,
             annotation_dir=args.annotation_dir

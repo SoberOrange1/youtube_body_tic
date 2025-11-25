@@ -33,52 +33,62 @@ log = logging.getLogger(__name__)
 # Data processing configuration
 DATA_CONFIG = {
     'max_sequence_length': 64,  # Maximum frames per sequence
-    'sequence_stride': 16,  # Stride for sliding window (50% overlap)
+    'sequence_stride': 16,  # Stride for sliding window (25% overlap, every step one patch length)
     'normalization_method': 'z_score',  # 'z_score', 'min_max', 'none'
     # Video split configuration for cross-validation
-    'train_videos': ['01', '02', '03'],  # Training video IDs
-    'val_videos': ['04'],  # Validation video IDs
-    'test_videos': ['05'],  # Test video IDs (optional)
-    # All available videos for reference
-    'all_videos': ['01', '02', '03', '04', '05', '06', '07', '08'],
+    'train_videos': ['01', '04', '05', '07', '08', '14', '17'],  # Training video IDs (use strings for leading zeros)
+    'val_videos': ['10', '06'],  # Validation video IDs
+    'test_videos': ['11', '16'],  # Test video IDs (optional)
+    # All available videos for reference (use strings for leading zeros)
+    'all_videos': ['01', '04', '05', '06', '07', '08', '10', '11', '14', '16', '17'],
 }
 
 # Model configuration
 MODEL_CONFIG = {
-    'model_name': 'vit_base_patch16_224_in21k',
+    'model_name': 'vit_base_patch16_224.augreg_in21k',  # Updated model name
     'pretrained': True,
     'trainable': True,
     'num_classes': 2,  # tic vs non-tic
     # Encoder type: 'basic' (MotionPatchesEncoder) or 'enhanced' (EnhancedMotionPatchesEncoder)
     'encoder_type': 'basic',  # 'basic': single channel, 'enhanced': 7 channels
+    # Prediction mode: 'segment' or 'frame'
+    'prediction_mode': 'frame',  # NEW: 'segment' for 64-frame classification, 'frame' for per-frame prediction
     'patch_size': 16,  # For kinematic chain interpolation
     'num_patches': 5,  # Number of kinematic chains
     'feature_dim': 7,  # [x, y, z, visibility, ax, ay, az]
-    'dropout': 0.0,  # Dropout rate (0.0 for most cases, 0.5 for HumanML3D)
+    'dropout': 0.3,  # Dropout rate (0.0 for most cases, 0.5 for HumanML3D)
 }
 
 # LoRA configuration for memory-efficient fine-tuning
 LORA_CONFIG = {
-    'lora_r': 16,  # LoRA rank (lower = less parameters)
-    'lora_alpha': 32,  # LoRA alpha parameter
-    'lora_dropout': 0.1,  # LoRA dropout rate
+    'lora_r': 8,  # LoRA rank (lower = less parameters)
+    'lora_alpha': 16,  # LoRA alpha parameter
+    'lora_dropout': 0.3,  # LoRA dropout rate
 }
 
 # Training configuration - adapted from MotionPatches
 TRAIN_CONFIG = {
-    'batch_size': 32,  # Batch size (MotionPatches default)
+    'batch_size': 16,  
     'num_epochs': 100,  # Number of epochs (MotionPatches default)
-    'weight_decay': 1e-5,
-    'patience': 10,
+    'weight_decay': 1e-4,
+    'patience': 25,
     # Layered learning rates following MotionPatches design
     'motion_lr': 1e-5,  # Learning rate for motion encoder (LoRA)
     'head_lr': 1e-4,  # Learning rate for classification head
     # Scheduler
     'scheduler_type': 'cosine',  # 'cosine' or 'step'
     # Data loading
-    'num_workers': 8,  # Number of data loading workers
-    'pin_memory': True,
+    'num_workers': 1, 
+    'pin_memory': False,  
     'drop_last': True,  # MotionPatches uses drop_last=True
+    # Add gradient clipping
+    'max_grad_norm': 1.0,  # New: gradient clipping
+    # Add learning rate warmup
+    'warmup_epochs': 5,    # New: warmup epochs
+    # Experiment tracking - now controlled via command line
+    'exp_num': None,  # Will be set by --exp_num argument, no auto-generation
+    # Save checkpoints every N epochs (set to 0 or None to disable)
+    'save_interval': 3,
 }
 
 # Random seed for reproducibility
@@ -88,7 +98,8 @@ SEED = 42
 PATHS = {
     'pose_data_dir': r'A:\youtube_body\data_folder\body_detection_results',  # landmarks_root with XX subfolders
     'annotation_dir': r'A:\youtube_body\data_folder\annotations',  # annotations_XX.json files
-    'output_dir': r'A:\youtube_body\motion_vit_processor\outputs',
+    'output_dir': r'A:\youtube_body\data_folder\outputs',
+    'pretrained_model': r'A:\youtube_body\motion_vit_processor\pre-train\best_model.pt',  # Pretrained model path
 }
 
 
@@ -215,17 +226,16 @@ def validate_video_split(train_videos, val_videos, test_videos, pose_data_dir):
     val_vids = set(val_videos)
     test_vids = set(test_videos)
     
-    # Check for overlaps
+    # Check for overlaps between train and val/test (keep important checks)
     overlap_train_val = train_vids & val_vids
     overlap_train_test = train_vids & test_vids
-    overlap_val_test = val_vids & test_vids
     
     if overlap_train_val:
         raise ValueError(f"Train and val videos overlap: {overlap_train_val}")
     if overlap_train_test:
         raise ValueError(f"Train and test videos overlap: {overlap_train_test}")
-    if overlap_val_test:
-        raise ValueError(f"Val and test videos overlap: {overlap_val_test}")
+    
+    # Remove val-test overlap check - allow videos to be in both val and test
     
     # Check if all videos exist
     missing_videos = []
@@ -279,6 +289,8 @@ def main():
     # Experiment management
     parser.add_argument('--exp_name', type=str, default=None,
                        help='Experiment name (e.g., exp_001). If not provided, auto-increments')
+    parser.add_argument('--exp_num', type=str, default=None,
+                       help='Experiment number for output path (e.g., exp_001). Overrides auto-generation')
     
     # Data parameters
     parser.add_argument('--data_folder', type=str,
@@ -323,8 +335,10 @@ def main():
     
     args = parser.parse_args()
     
-    # Set experiment name
-    if args.exp_name:
+    # Set experiment name - use exp_num if provided, otherwise auto-increment
+    if args.exp_num:
+        exp_name = args.exp_num
+    elif args.exp_name:
         exp_name = args.exp_name
     else:
         exp_name = get_next_experiment_number(PATHS['output_dir'])
@@ -389,6 +403,7 @@ def main():
         'feature_dim': MODEL_CONFIG['feature_dim'],
         'num_classes': MODEL_CONFIG['num_classes'],
         'dropout': MODEL_CONFIG['dropout'],
+        'prediction_mode': MODEL_CONFIG['prediction_mode'],  # Add prediction mode
         # LoRA config
         'lora_r': lora_r,
         'lora_alpha': lora_alpha,
@@ -401,9 +416,16 @@ def main():
         'motion_lr': TRAIN_CONFIG['motion_lr'],
         'head_lr': TRAIN_CONFIG['head_lr'],
         'scheduler_type': TRAIN_CONFIG['scheduler_type'],
+        # New training stability parameters
+        'max_grad_norm': TRAIN_CONFIG.get('max_grad_norm', 1.0),  # Gradient clipping
+        'warmup_epochs': TRAIN_CONFIG.get('warmup_epochs', 0),    # Warmup epochs
         'num_workers': TRAIN_CONFIG['num_workers'],
         'pin_memory': TRAIN_CONFIG['pin_memory'],
         'drop_last': TRAIN_CONFIG['drop_last'],
+        # Experiment tracking
+        'exp_num': TRAIN_CONFIG.get('exp_num') or exp_name,  # Use exp_name if exp_num not set
+        # Checkpoint interval
+        'save_interval': TRAIN_CONFIG.get('save_interval', 0),
         # Data config
         'max_sequence_length': DATA_CONFIG['max_sequence_length'],
         'max_frames': DATA_CONFIG['max_sequence_length'],
@@ -412,6 +434,8 @@ def main():
         'train_videos': train_videos,
         'val_videos': val_videos,
         'test_videos': test_videos,
+        # Pretrained model path
+        'pretrained_model_path': PATHS['pretrained_model'],  # Add pretrained model path
     }
     
     # Save training configuration

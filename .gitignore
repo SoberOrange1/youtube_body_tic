@@ -187,6 +187,7 @@ saved_models/
 temp/
 tmp/
 *.tmp
+utils/file_process.py
 
 # Large files
 *.zip

@@ -18,7 +18,7 @@ class MotionPatchesEncoder(nn.Module):
     
     def __init__(
         self,
-        model_name: str = "vit_base_patch16_224_in21k",
+        model_name: str = "vit_base_patch16_224.augreg_in21k",  # Updated model name
         pretrained: bool = True,
         trainable: bool = True,
         patch_size: int = 16,
@@ -48,21 +48,27 @@ class MotionPatchesEncoder(nn.Module):
         img_height = max_frames
         img_width = patch_size * num_patches
         
+        print(f"Creating ViT with image size: {img_height}x{img_width}, channels: {input_channels}")
+        
         # Create ViT backbone following MotionPatches design
         self.motion_encoder = timm.create_model(
             model_name,
             pretrained=pretrained,
-            num_classes=0,
-            global_pool="avg",
+            num_classes=0,  # Remove built-in classifier - we'll use our own
+            global_pool="avg",  # Ensure global pooling is enabled
             img_size=(img_height, img_width),  # (64, 80)
             in_chans=input_channels
         )
+        
+        print(f"ViT model created successfully: {type(self.motion_encoder)}")
+        print(f"ViT num_features: {self.motion_encoder.num_features}")
+        print(f"ViT global_pool: {getattr(self.motion_encoder, 'global_pool', 'not found')}")
         
         # Set trainable parameters
         for param in self.motion_encoder.parameters():
             param.requires_grad = trainable
         
-        # Get feature dimension
+        # Get feature dimension - this should be a single number like 768
         self.feature_dim = self.motion_encoder.num_features
         
         # Classification head for tic detection
@@ -74,6 +80,8 @@ class MotionPatchesEncoder(nn.Module):
             nn.Dropout(0.1),
             nn.Linear(256, num_classes)
         )
+        
+        print(f"Motion encoder initialized with feature_dim: {self.feature_dim}")
     
     def apply_kinematic_chain_patches(self, motion_features: torch.Tensor) -> torch.Tensor:
         """
@@ -140,21 +148,78 @@ class MotionPatchesEncoder(nn.Module):
             features: Extracted features (batch_size, feature_dim)
             logits: Classification logits (batch_size, num_classes)
         """
+        print(f"MotionPatchesEncoder.forward input shape: {x.shape}")
+        
         # Convert to motion patch representation
         motion_image = self.apply_kinematic_chain_patches(x)
+        print(f"Motion image shape after patches: {motion_image.shape}")
         
-        # Extract features using ViT
-        features = self.motion_encoder(motion_image)
+        # Extract features using ViT - ensure proper input format
+        try:
+            features = self.motion_encoder.forward_features(motion_image)
+            print(f"Features shape after ViT: {features.shape}")
+            
+            # Apply global pooling if needed
+            if hasattr(self.motion_encoder, 'global_pool') and self.motion_encoder.global_pool == 'avg':
+                # Features should already be pooled by forward_features
+                pass
+            else:
+                # Manual pooling if needed
+                if len(features.shape) > 2:
+                    features = features.mean(dim=1)  # Pool over sequence dimension
+        except Exception as e:
+            print(f"Error in ViT forward: {e}")
+            print(f"Motion image shape: {motion_image.shape}")
+            print(f"Motion encoder type: {type(self.motion_encoder)}")
+            # Fallback to direct forward
+            features = self.motion_encoder(motion_image)
+        
+        print(f"Final features shape: {features.shape}")
         
         # Classification
         logits = self.classifier(features)
+        print(f"Logits shape: {logits.shape}")
         
         return features, logits
     
     def extract_features(self, x: torch.Tensor) -> torch.Tensor:
         """Extract features without classification"""
         motion_image = self.apply_kinematic_chain_patches(x)
-        return self.motion_encoder(motion_image)
+        
+        # Use forward_features to get patch tokens from ViT
+        try:
+            if hasattr(self.motion_encoder, 'forward_features'):
+                features = self.motion_encoder.forward_features(motion_image)
+                
+                # Handle ViT output format - ensure we get a single feature vector per sample
+                if len(features.shape) == 3:  # (batch_size, num_patches, feature_dim)
+                    # Apply global pooling to get (batch_size, feature_dim)
+                    if hasattr(self.motion_encoder, 'global_pool') and self.motion_encoder.global_pool:
+                        # Use the model's built-in pooling if available
+                        features = features.mean(dim=1)  # Average pool over patches
+                    else:
+                        # Manual average pooling
+                        features = features.mean(dim=1)
+                elif len(features.shape) == 2:  # Already pooled (batch_size, feature_dim)
+                    pass
+                else:
+                    raise ValueError(f"Unexpected feature shape from ViT: {features.shape}")
+                
+                return features
+            else:
+                # Fallback to direct forward call
+                return self.motion_encoder(motion_image)
+        except Exception as e:
+            print(f"Error in extract_features: {e}")
+            # If LoRA is applied, try to access the base model directly
+            if hasattr(self.motion_encoder, 'base_model'):
+                features = self.motion_encoder.base_model.forward_features(motion_image)
+                # Apply the same pooling logic for base model
+                if len(features.shape) == 3:
+                    features = features.mean(dim=1)
+                return features
+            else:
+                raise e
 
 
 class EnhancedMotionPatchesEncoder(nn.Module):
@@ -166,7 +231,7 @@ class EnhancedMotionPatchesEncoder(nn.Module):
     
     def __init__(
         self,
-        model_name: str = "vit_base_patch16_224_in21k",
+        model_name: str = "vit_base_patch16_224.augreg_in21k",  # Updated model name
         pretrained: bool = True,
         trainable: bool = True,
         patch_size: int = 16,
@@ -195,6 +260,8 @@ class EnhancedMotionPatchesEncoder(nn.Module):
         img_height = max_frames
         img_width = patch_size * num_patches
         
+        print(f"Creating Enhanced ViT with image size: {img_height}x{img_width}, channels: {input_channels}")
+        
         # Create ViT backbone with 7 input channels
         self.motion_encoder = timm.create_model(
             model_name,
@@ -216,6 +283,8 @@ class EnhancedMotionPatchesEncoder(nn.Module):
             nn.Dropout(0.1),
             nn.Linear(256, num_classes)
         )
+        
+        print(f"Enhanced motion encoder initialized with feature_dim: {self.motion_encoder.num_features}")
     
     def apply_enhanced_patches(self, motion_features: torch.Tensor) -> torch.Tensor:
         """
@@ -283,16 +352,67 @@ class EnhancedMotionPatchesEncoder(nn.Module):
             features: Extracted features (batch_size, feature_dim)
             logits: Classification logits (batch_size, num_classes)
         """
+        print(f"EnhancedMotionPatchesEncoder.forward input shape: {x.shape}")
+        
         # Convert to 7-channel motion image
         motion_image = self.apply_enhanced_patches(x)
+        print(f"Enhanced motion image shape: {motion_image.shape}")
         
-        # Extract features using ViT
-        features = self.motion_encoder(motion_image)
+        # Extract features using ViT - use forward_features for better compatibility
+        try:
+            features = self.motion_encoder.forward_features(motion_image)
+            print(f"Enhanced features shape: {features.shape}")
+            
+            # Apply global pooling if needed
+            if len(features.shape) > 2:
+                features = features.mean(dim=1)  # Pool over sequence dimension
+                
+        except Exception as e:
+            print(f"Error in Enhanced ViT forward: {e}")
+            # Fallback to direct forward
+            features = self.motion_encoder(motion_image)
+        
+        print(f"Final enhanced features shape: {features.shape}")
         
         # Classification
         logits = self.classifier(features)
+        print(f"Enhanced logits shape: {logits.shape}")
         
         return features, logits
+    
+    def extract_features(self, x: torch.Tensor) -> torch.Tensor:
+        """Extract features without classification"""
+        motion_image = self.apply_enhanced_patches(x)
+        
+        # Use forward_features to get patch tokens from ViT
+        try:
+            if hasattr(self.motion_encoder, 'forward_features'):
+                features = self.motion_encoder.forward_features(motion_image)
+                
+                # Handle ViT output format - ensure we get a single feature vector per sample
+                if len(features.shape) == 3:  # (batch_size, num_patches, feature_dim)
+                    # Apply global pooling to get (batch_size, feature_dim)
+                    features = features.mean(dim=1)  # Average pool over patches
+                elif len(features.shape) == 2:  # Already pooled (batch_size, feature_dim)
+                    pass
+                else:
+                    raise ValueError(f"Unexpected feature shape from ViT: {features.shape}")
+                
+                return features
+            else:
+                # Fallback to direct forward call
+                return self.motion_encoder(motion_image)
+        except Exception as e:
+            print(f"Error in extract_features: {e}")
+            # If LoRA is applied, try to access the base model directly
+            if hasattr(self.motion_encoder, 'base_model'):
+                features = self.motion_encoder.base_model.forward_features(motion_image)
+                # Apply the same pooling logic for base model
+                if len(features.shape) == 3:
+                    features = features.mean(dim=1)
+                return features
+            else:
+                raise e
 
 
 # 保持原有的其他编码器类不变
